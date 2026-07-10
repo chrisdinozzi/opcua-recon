@@ -8,6 +8,7 @@ package main
 // Third-party ones are full paths that look like URLs ("github.com/...").
 // Go is strict: if you import something and don't use it, it won't compile.
 import (
+	"bufio"
 	"context" // for timeouts/cancellation — passed into network calls
 	"flag"    // parses command-line flags like -endpoint
 	"fmt"     // formatted printing (Println, Printf, etc.)
@@ -42,8 +43,9 @@ func main() {
 	//   arg 3: the help text shown by -h
 	// It returns a *pointer* to a string (that's what the * means in the type).
 	// We'll dereference it later with *endpoint to read the actual value.
-	endpoint := flag.String("endpoint", "opc.tcp://localhost:4840", "OPC-UA endpoint URL")
-	ip := flag.String("ip", "0.0.0.0", "OPC-UA server IP")
+	endpoint := flag.String("endpoint", "", "OPC-UA endpoint URL")
+	ip := flag.String("ip", "", "OPC-UA server IP")
+	ip_file := flag.String("ip-file", "", "New line deliminated file of IPs to scan")
 	port := flag.Int("port", 4840, "OPC-UA server port. Default 4840")
 	// A bool flag. Present ("-probe") = true, absent = false.
 	probe := flag.Bool("probe", false, "also actively test whether anonymous login truly works")
@@ -52,10 +54,18 @@ func main() {
 	// Nothing is populated until Parse() runs.
 	flag.Parse()
 
-	if ip != nil {
+	var mass_scan = false
+	if *ip_file != "" {
+		mass_scan = true
+	}
+	if *ip != "" {
 		url := fmt.Sprintf("opc.tcp://%s:%d", *ip, *port)
 		endpoint = &url
 
+	}
+
+	if mass_scan == true {
+		parseIPFile(*ip_file)
 	}
 
 	color.Blue("Target: ", *endpoint)
@@ -77,6 +87,25 @@ func main() {
 
 	scanServer(ctx, endpoint, probe)
 
+}
+
+func parseIPFile(file_name string) []string {
+	var targets []string
+	targets_file, err := os.Open(file_name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "File Read Failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer targets_file.Close()
+
+	scanner := bufio.NewScanner(targets_file)
+
+	for scanner.Scan() {
+		targets = append(targets, scanner.Text())
+	}
+
+	fmt.Println(targets)
+	return targets
 }
 
 func scanServer(ctx context.Context, endpoint *string, probe *bool) {
