@@ -20,9 +20,12 @@ import (
 	"fmt"  // formatted printing (Println, Printf, etc.)
 	"math/big"
 	"net/url"
-	"os"     // access to os.Stderr and os.Exit for error handling
-	"regexp" // to sort the list of auth methods alphabetically
-	"time"   // for time.Second when building the timeout
+	"os" // access to os.Stderr and os.Exit for error handling
+
+	// to sort the list of auth methods alphabetically
+	"strconv"
+	"strings"
+	"time" // for time.Second when building the timeout
 
 	// The gopcua library, split into two packages we need:
 	"github.com/fatih/color"
@@ -66,8 +69,6 @@ const banner = `
   ####  #       ####         ####  #    #    #    # ######  ####   ####  #    # 
 `
 
-// "func main()" is the entry point. When you run the program, Go calls this.
-// The empty () means it takes no arguments; no return type means it returns nothing.
 func main() {
 	fmt.Println(banner)
 
@@ -80,8 +81,8 @@ func main() {
 	pass := flag.String("pass", "", "Password for authentication")
 	probe_credentials := flag.Bool("probe-creds", false, "Attempt authentication with credentials")
 	probe_write := flag.Bool("probe-write", false, "Scan for writeable tags")
+	rewrite_host := flag.Bool("rewrite-host", false, "Rewrite the endpoint host with the provided host. required for scanning servers behind NAT/Firewalls")
 	flag.Parse()
-	fmt.Printf("Username: %s\nPassword: %s\n", *user, *pass)
 
 	var mass_scan = false
 	if *ip_file != "" {
@@ -90,7 +91,6 @@ func main() {
 	if *ip != "" {
 		url := fmt.Sprintf("opc.tcp://%s:%d", *ip, *port)
 		endpoint = &url
-
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -101,11 +101,11 @@ func main() {
 		fmt.Println("Targets: ", targets)
 		for i, endpoint := range targets {
 			fmt.Println(i + 1)
-			scanServer(ctx, &endpoint, user, pass, probe_anon, probe_credentials, probe_write)
+			scanServer(ctx, &endpoint, user, pass, probe_anon, probe_credentials, probe_write, rewrite_host)
 		}
 	} else {
 		fmt.Println("Target: ", *endpoint)
-		scanServer(ctx, endpoint, user, pass, probe_anon, probe_credentials, probe_write)
+		scanServer(ctx, endpoint, user, pass, probe_anon, probe_credentials, probe_write, rewrite_host)
 	}
 }
 
@@ -123,9 +123,8 @@ func parseIPFile(file_name string, port int) []string {
 	for scanner.Scan() {
 		//check if a port is appended already to the IP
 		target := scanner.Text()
-		match, _ := regexp.MatchString(`\d*.\d*.\d*.\d*.:\d*`, target)
-		if !match {
-			target = target + string(port)
+		if !strings.Contains(target, ":") {
+			target = target + ":" + strconv.Itoa(port)
 		}
 		target = "opc.tcp://" + target
 		targets = append(targets, target)
@@ -134,7 +133,7 @@ func parseIPFile(file_name string, port int) []string {
 	return targets
 }
 
-func scanServer(ctx context.Context, endpoint, user, pass *string, probe_anon, probe_credentials, probe_write *bool) {
+func scanServer(ctx context.Context, endpoint, user, pass *string, probe_anon, probe_credentials, probe_write, rewrite_host *bool) {
 	endpoints, err := opcua.GetEndpoints(ctx, *endpoint)
 
 	if err != nil {
@@ -144,14 +143,20 @@ func scanServer(ctx context.Context, endpoint, user, pass *string, probe_anon, p
 
 	fmt.Printf("=== %s ===\n%d endpoint(s)\n\n", *endpoint, len(endpoints))
 
-	anyAnonymous := false
-	anyCredential := false
-
-	seen := make(map[string]bool)
 	scanned_endpoints := []endpointDetails{}
 
 	for i, ep := range endpoints {
-
+		anyAnonymous := false
+		anyCredential := false
+		if *rewrite_host {
+			dialledURL, err := url.Parse(*endpoint)
+			if err != nil {
+				fmt.Println("Error parsing endpoint URL.")
+				os.Exit(1)
+			}
+			dialledHost := dialledURL.Hostname()
+			rewriteEndpointHost(ep, dialledHost)
+		}
 		var methods []string
 
 		for _, tok := range ep.UserIdentityTokens {
@@ -159,7 +164,6 @@ func scanServer(ctx context.Context, endpoint, user, pass *string, probe_anon, p
 			name := tokenTypeName(tok.TokenType)
 
 			methods = append(methods, name)
-			seen[name] = true
 
 			switch tok.TokenType {
 			case ua.UserTokenTypeAnonymous:
@@ -207,7 +211,7 @@ func scanServer(ctx context.Context, endpoint, user, pass *string, probe_anon, p
 		}
 		if *probe_anon && anyAnonymous {
 			color.Green("[*] Checking if Anonymous access works...")
-			runAnonymousProbe(ctx, *endpoint)
+			runAnonymousProbe(ctx, ep, *endpoint)
 		}
 
 		if *probe_credentials && anyCredential {
@@ -217,14 +221,28 @@ func scanServer(ctx context.Context, endpoint, user, pass *string, probe_anon, p
 		if *probe_write && (anyAnonymous || anyCredential) {
 			runWriteableProbe(ctx, ep, *user, *pass, anyAnonymous)
 		}
-		os.Exit(0)
+		//os.Exit(0)
 	}
 	fmt.Println("---")
 
 }
 
-func runAnonymousProbe(ctx context.Context, endpoint string) {
-	c, err := opcua.NewClient(endpoint, opcua.AuthAnonymous())
+func rewriteEndpointHost(ep *ua.EndpointDescription, dialledHost string) {
+	u, err := url.Parse(ep.EndpointURL)
+	if err != nil {
+		return
+	}
+	advertisedHost := u.Hostname()
+	if advertisedHost != dialledHost {
+		fmt.Printf("[*]Advertised host (%s) differs from dialled host (%s), replacing advertised with dialed.\n\n", advertisedHost, dialledHost)
+		u.Host = dialledHost + ":" + u.Port()
+		ep.EndpointURL = u.String()
+		fmt.Printf("Advertised: %s\nDialled:%s\nEndpoint URL: %s\n", advertisedHost, dialledHost, ep.EndpointURL)
+	}
+}
+
+func runAnonymousProbe(ctx context.Context, ep *ua.EndpointDescription, endpoint string) {
+	c, err := opcua.NewClient(endpoint, opcua.SecurityFromEndpoint(ep, ua.UserTokenTypeAnonymous), opcua.AuthAnonymous())
 	if err != nil {
 		fmt.Printf("[-] could not build client: %v\n", err)
 		return
@@ -286,9 +304,9 @@ func runWriteableProbe(ctx context.Context, endpoint *ua.EndpointDescription, us
 	var c *opcua.Client
 	var err error
 	if isAnon { //anon auth
-		fmt.Printf("[*] Attempting to find writeable tags with Anonymous credentials\n")
+		fmt.Printf("[*] Attempting to find writeable tags on %s with Anonymous credentials\n", endpoint.EndpointURL)
 
-		c, err = opcua.NewClient(endpoint.EndpointURL, opcua.AuthAnonymous())
+		c, err = opcua.NewClient(endpoint.EndpointURL, opcua.SecurityFromEndpoint(endpoint, ua.UserTokenTypeAnonymous), opcua.AuthAnonymous())
 		if err != nil {
 			fmt.Printf("[-] could not build client: %v\n", err)
 			return
@@ -335,7 +353,7 @@ func runWriteableProbe(ctx context.Context, endpoint *ua.EndpointDescription, us
 	visited := make(map[string]bool)
 	var tags []tag
 	err = browseTags(ctx, c.Node(id), 0, "", &tags, visited)
-	fmt.Printf(prettyPrint(tags))
+	fmt.Print(prettyPrint(tags))
 
 }
 
@@ -360,13 +378,13 @@ func browseTags(ctx context.Context, n *opcua.Node, level int, path string, tags
 		ua.AttributeIDBrowseName,      //2
 		ua.AttributeIDDescription,     //3
 		ua.AttributeIDDataType,        //4
+		ua.AttributeIDValue,           //5
 
 	)
 
 	if err != nil {
 		fmt.Printf("Attr read error: %v\n", err)
-		return nil // bail out of THIS node, don't index into an empty slice
-
+		return nil
 	}
 
 	node_class := ua.NodeClass(attrs[0].Value.Int())
@@ -375,7 +393,7 @@ func browseTags(ctx context.Context, n *opcua.Node, level int, path string, tags
 	path = path + "." + browse_name.Value.String()
 
 	if node_class == ua.NodeClassVariable {
-		value, _ := n.Value(ctx)
+		value := attrs[5].Value
 		//fmt.Printf("Value: %v\n", value)
 		access_level := ua.AccessLevelType(attrs[1].Value.Uint())
 		//fmt.Printf("Access Level: %s\n", access_level)
@@ -394,10 +412,6 @@ func browseTags(ctx context.Context, n *opcua.Node, level int, path string, tags
 
 	}
 
-	//fmt.Printf("Node ID: %s\n", n.ID)
-	//fmt.Printf("Browser Name: %s\n", browse_name.Value)
-	//fmt.Printf("Description Name: %s\n\n", description.Value)
-
 	nodes, err := n.ReferencedNodes(ctx, id.HierarchicalReferences, ua.BrowseDirectionForward, ua.NodeClassAll, true)
 
 	if err != nil {
@@ -406,20 +420,9 @@ func browseTags(ctx context.Context, n *opcua.Node, level int, path string, tags
 	}
 	for _, node := range nodes {
 		browseTags(ctx, node, level+1, path, tags, visited)
-		if err != nil {
-			continue
-		}
 	}
 
 	return nil
-}
-
-// Returns the auth options plus the token type to select on the endpoint.
-func authOptions(user, pass string) ([]opcua.Option, ua.UserTokenType) {
-	if user == "" {
-		return []opcua.Option{opcua.AuthAnonymous()}, ua.UserTokenTypeAnonymous
-	}
-	return []opcua.Option{opcua.AuthUsername(user, pass)}, ua.UserTokenTypeUserName
 }
 
 func generateCertificate() {
