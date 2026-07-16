@@ -43,7 +43,7 @@ type tag struct {
 	Value       interface{}
 }
 
-const maxDepth = 100
+const maxDepth = 10
 
 const banner = `
                                                                                 
@@ -69,10 +69,12 @@ func main() {
 	pass := flag.String("pass", "", "Password for authentication")
 	probeCreds := flag.Bool("probe-creds", false, "Attempt authentication with credentials")
 	probeWrite := flag.Bool("probe-write", false, "Scan for writeable tags")
+	batchSize := flag.Int("batch-size", 50, "number of nodes to collect before reading their attributes (1 = stream one at a time, large = collect-all-then-read)")
 	rewriteHost := flag.Bool("rewrite-host", false, "Rewrite the endpoint host with the provided host. required for scanning servers behind NAT/Firewalls")
 
 	flag.BoolVar(&verbose, "verbose", false, "enable verbose output")
 	flag.Parse()
+	verboseOutput("Flag Values:\n\tEndpoint: %s\n\tIP: %s\n\tIP File:%s\n\tPort: %d\n\tProbe Anon:%t\n\tProbe Creds:%t\n\tUsername: %s\n\tPassword: %s\n\tProbe Write: %t\n\tBatch Size: %d\n\n", *endpoint, *ip, *ipFile, *port, *probeAnon, *probeCreds, *user, *pass, *probeWrite, *batchSize)
 
 	var massScan = false
 	if *ipFile != "" {
@@ -91,11 +93,11 @@ func main() {
 		fmt.Println("Targets: ", targets)
 		for i, endpoint := range targets {
 			fmt.Println(i + 1)
-			scanServer(ctx, &endpoint, user, pass, probeAnon, probeCreds, probeWrite, rewriteHost)
+			scanServer(ctx, &endpoint, user, pass, probeAnon, probeCreds, probeWrite, rewriteHost, *batchSize)
 		}
 	} else {
 		fmt.Println("Target: ", *endpoint)
-		scanServer(ctx, endpoint, user, pass, probeAnon, probeCreds, probeWrite, rewriteHost)
+		scanServer(ctx, endpoint, user, pass, probeAnon, probeCreds, probeWrite, rewriteHost, *batchSize)
 	}
 }
 
@@ -123,7 +125,7 @@ func parseIPFile(fileName string, port int) []string {
 	return targets
 }
 
-func scanServer(ctx context.Context, endpoint, user, pass *string, probeAnon, probeCreds, probeWrite, rewriteHost *bool) {
+func scanServer(ctx context.Context, endpoint, user, pass *string, probeAnon, probeCreds, probeWrite, rewriteHost *bool, batchSize int) {
 	endpoints, err := opcua.GetEndpoints(ctx, *endpoint)
 
 	if err != nil {
@@ -215,9 +217,9 @@ func scanServer(ctx context.Context, endpoint, user, pass *string, probeAnon, pr
 			runCredentialProbe(ctx, ep, *user, *pass)
 		}
 		if *probeWrite && (anyAnonymous || anyCredential) {
-			runWriteableProbe(ctx, ep, *user, *pass, anyAnonymous)
+			runWriteableProbe(ctx, ep, *user, *pass, anyAnonymous, batchSize)
 		}
-		//os.Exit(0)
+		os.Exit(0)
 	}
 	fmt.Println("---")
 
@@ -287,8 +289,8 @@ func runCredentialProbe(ctx context.Context, endpoint *ua.EndpointDescription, u
 	color.Green("[+] credential login SUCCEEDED")
 }
 
-func runWriteableProbe(ctx context.Context, endpoint *ua.EndpointDescription, user, pass string, isAnon bool) {
-	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+func runWriteableProbe(ctx context.Context, endpoint *ua.EndpointDescription, user, pass string, isAnon bool, batchSize int) {
+	ctx, cancel := context.WithTimeout(ctx, 30000*time.Second)
 	defer cancel()
 	var c *opcua.Client
 	var err error
@@ -333,46 +335,18 @@ func runWriteableProbe(ctx context.Context, endpoint *ua.EndpointDescription, us
 		return
 	}
 	visited := make(map[string]bool)
-	var nodes []*ua.NodeID
+	var pending []*ua.NodeID
+	var tags []tag
 	start := time.Now()
-	collectNodes(ctx, c.Node(startNodeId), 0, visited, &nodes)
-	verboseOutput("collected %d nodes in %s\n", len(nodes), time.Since(start))
-	color.Green("[+] collected %d nodes", len(nodes))
 
-	tags := readAllChunked(ctx, c, nodes)
+	walkAndReport(ctx, c, c.Node(startNodeId), 0, visited, &pending, &tags, batchSize)
+	flushBatch(ctx, c, &pending, &tags) // flush whatever's left under batchSize at the end
+
 	color.Green("[+] %d writeable tags found", len(tags))
-	verboseOutput("found %d writeable tags in %s\n", len(tags), time.Since(start))
-	for _, tag := range tags {
-		fmt.Printf("%s: %s\n", tag.BrowseName, tag.Description)
-	}
+	verboseOutput("scan took %s, visited %d nodes\n", time.Since(start), len(visited))
 
-	verboseOutput(prettyPrint(tags))
+	//verboseOutput(prettyPrint(tags))
 
-}
-
-func collectNodes(ctx context.Context, n *opcua.Node, level int, visited map[string]bool, out *[]*ua.NodeID) {
-	if level > maxDepth || ctx.Err() != nil {
-		return
-	}
-	key := n.ID.String()
-	if visited[key] {
-		return
-	}
-	visited[key] = true
-	if key == "i=2253" { // skip server diagnostics subtree
-		return
-	}
-
-	*out = append(*out, n.ID)
-
-	nodes, err := n.ReferencedNodes(ctx, id.HierarchicalReferences, ua.BrowseDirectionForward, ua.NodeClassAll, true)
-	if err != nil {
-		verboseOutput("browse failed at %s: %v\n", key, err)
-		return
-	}
-	for _, child := range nodes {
-		collectNodes(ctx, child, level+1, visited, out)
-	}
 }
 
 const attrsPerNode = 4 // NodeClass, UserAccessLevel, BrowseName, Value — order matters
@@ -390,9 +364,10 @@ func readNodeChunk(ctx context.Context, c *opcua.Client, ids []*ua.NodeID) ([]ta
 	if err != nil {
 		return nil, err
 	}
-
+	verboseOutput("requested %d, got %d results\n", len(attsToRead), len(resp.Results))
 	var writeable []tag
 	for i, nodeId := range ids {
+		verboseOutput("Reading: " + nodeId.String())
 		base := i * attrsPerNode // results[base .. base+attrsPerNode) belong to ids[i]
 		nodeClass := resp.Results[base+0]
 		accessLevel := resp.Results[base+1]
@@ -421,27 +396,60 @@ func readNodeChunk(ctx context.Context, c *opcua.Client, ids []*ua.NodeID) ([]ta
 		if val != nil && val.Value != nil {
 			tag.Value = val.Value.Value()
 		}
+		//color.Green("[+] Found writeable tag: " + tag.BrowseName)
+
 		writeable = append(writeable, tag)
 	}
 	return writeable, nil
 }
 
-const chunkSize = 500 // 500 nodes * 4 attrs = 2000 ReadValueIDs per request
-func readAllChunked(ctx context.Context, c *opcua.Client, ids []*ua.NodeID) []tag {
-	var all []tag
-	for start := 0; start < len(ids); start += chunkSize {
-		end := start + chunkSize
-		if end > len(ids) {
-			end = len(ids)
-		}
-		found, err := readNodeChunk(ctx, c, ids[start:end])
-		if err != nil {
-			verboseOutput("chunk [%d:%d] read failed: %v\n", start, end, err)
-			continue // one bad chunk doesn't abort the rest
-		}
-		all = append(all, found...)
+func walkAndReport(ctx context.Context, c *opcua.Client, n *opcua.Node, level int, visited map[string]bool, pending *[]*ua.NodeID, found *[]tag, batchSize int) {
+	if level > maxDepth {
+		color.Red("[-] Max Depth Exceeded (Level=%d MaxDepth=%d)", level, maxDepth)
+		return
 	}
-	return all
+	if ctx.Err() != nil {
+		color.Red("[-]Context error:%s", ctx.Err())
+	}
+	key := n.ID.String()
+	if visited[key] {
+		verboseOutput("[-] Node (%s) already visited, skipping", key)
+		return
+	}
+	visited[key] = true
+	if key == "i=2253" { // skip server diagnostics subtree
+		verboseOutput("[-] Node (%s) part of server diagnostics, skipping", key)
+		return
+	}
+	*pending = append(*pending, n.ID)
+	if len(*pending) >= batchSize {
+		flushBatch(ctx, c, pending, found)
+	}
+	nodes, err := n.ReferencedNodes(ctx, id.HierarchicalReferences, ua.BrowseDirectionForward, ua.NodeClassAll, true)
+	if err != nil {
+		verboseOutput("browse failed at %s: %v\n", key, err)
+		return
+	}
+	for _, child := range nodes {
+		walkAndReport(ctx, c, child, level+1, visited, pending, found, batchSize)
+	}
+}
+
+func flushBatch(ctx context.Context, c *opcua.Client, pending *[]*ua.NodeID, found *[]tag) {
+	if len(*pending) == 0 {
+		return
+	}
+	results, err := readNodeChunk(ctx, c, *pending)
+	if err != nil {
+		verboseOutput("batch read failed (%d nodes): %v\n", len(*pending), err)
+		*pending = nil
+		return
+	}
+	for _, t := range results {
+		color.Green("[+] Found writeable tag: %s (%s)", t.BrowseName, t.NodeID.String())
+	}
+	*found = append(*found, results...)
+	*pending = nil // reset for the next batch
 }
 
 func tokenTypeName(t ua.UserTokenType) string {
@@ -488,5 +496,6 @@ func prettyPrint(i interface{}) string {
 func verboseOutput(output string, args ...interface{}) {
 	if verbose {
 		fmt.Printf(output, args...)
+		fmt.Println()
 	}
 }
