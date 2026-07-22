@@ -3,10 +3,16 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/csv"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
+	"math/big"
 	"net/url"
 	"os"
 	"strconv"
@@ -62,11 +68,9 @@ func main() {
 	probeWrite := flag.Bool("probe-write", false, "Scan for writeable tags")
 	batchSize := flag.Int("batch-size", 50, "number of nodes to collect before reading their attributes (1 = stream one at a time, large = collect-all-then-read)")
 	rewriteHost := flag.Bool("rewrite-host", false, "Rewrite the endpoint host with the provided host. required for scanning servers behind NAT/Firewalls")
-
 	flag.BoolVar(&verbose, "verbose", false, "enable verbose output")
-
 	outputFile := flag.String("output-file", "", "a .csv output of writeable tags.")
-
+	cleanupCerts := flag.Bool("cleanup-certs", false, "delete generated client certificate/key files when the scan finishes")
 	flag.Parse()
 
 	if len(os.Args) == 1 {
@@ -101,6 +105,11 @@ func main() {
 	} else {
 		fmt.Println("Target: ", *endpoint)
 		scanServer(ctx, endpoint, user, pass, outputFile, *probeAnon, *probeCreds, *probeWrite, *rewriteHost, *batchSize)
+	}
+
+	if *cleanupCerts {
+		os.Remove("client_cert.pem")
+		os.Remove("client_key.pem")
 	}
 }
 
@@ -199,9 +208,12 @@ func scanServer(ctx context.Context, endpoint, user, pass, outputFile *string, p
 			fmt.Println("[-] No user identity tokens advertised (weird — check manually)")
 		}
 
-		if ep.SecurityMode != ua.MessageSecurityModeNone {
-			color.Red("[-] Security is enabled, cannot probe: " + ep.SecurityMode.String())
-			continue
+		if (probeAnon || probeCreds || probeWrite) && ep.SecurityMode != ua.MessageSecurityModeNone {
+			color.Green("[*] Generating certificates")
+			if err := generateCertificateForPolicy(ep.SecurityPolicyURI, "client_cert.pem", "client_key.pem"); err != nil {
+				color.Red("[-] could not generate certificate, skipping probes for this endpoint: %v", err)
+				continue
+			}
 		}
 
 		if probeAnon && anyAnonymous {
@@ -214,7 +226,7 @@ func scanServer(ctx context.Context, endpoint, user, pass, outputFile *string, p
 			runCredentialProbe(ctx, ep, *user, *pass)
 		}
 		if probeWrite && (anyAnonymous || anyCredential) {
-			runWriteableProbe(ctx, ep, *user, *pass, anyAnonymous, batchSize, *outputFile)
+			runWriteableProbe(ctx, ep, *user, *pass, anyAnonymous, anyCredential, batchSize, *outputFile)
 		}
 	}
 	fmt.Println("---")
@@ -236,7 +248,20 @@ func rewriteEndpointHost(ep *ua.EndpointDescription, dialledHost string) {
 }
 
 func runAnonymousProbe(ctx context.Context, ep *ua.EndpointDescription, endpoint string) {
-	c, err := opcua.NewClient(endpoint, opcua.SecurityFromEndpoint(ep, ua.UserTokenTypeAnonymous), opcua.AuthAnonymous())
+
+	opts := []opcua.Option{
+		opcua.SecurityFromEndpoint(ep, ua.UserTokenTypeAnonymous),
+		opcua.AuthAnonymous(),
+	}
+	if ep.SecurityMode != ua.MessageSecurityModeNone {
+		opts = append(opts,
+			opcua.CertificateFile("client_cert.pem"),
+			opcua.PrivateKeyFile("client_key.pem"),
+			opcua.ApplicationURI("urn:cdino:opcua-recon"),
+		)
+	}
+	c, err := opcua.NewClient(endpoint, opts...)
+
 	if err != nil {
 		fmt.Printf("[-] could not build client: %v\n", err)
 		return
@@ -263,7 +288,12 @@ func runCredentialProbe(ctx context.Context, endpoint *ua.EndpointDescription, u
 		opcua.SecurityFromEndpoint(endpoint, ua.UserTokenTypeUserName),
 		opcua.ApplicationURI("urn:cdino:opcua-recon"),
 	}
-
+	if endpoint.SecurityMode != ua.MessageSecurityModeNone {
+		opts = append(opts,
+			opcua.CertificateFile("client_cert.pem"),
+			opcua.PrivateKeyFile("client_key.pem"),
+		)
+	}
 	c, err := opcua.NewClient(endpoint.EndpointURL, opts...)
 	if err != nil {
 		fmt.Printf("[-] could not build client: %v\n", err)
@@ -280,15 +310,28 @@ func runCredentialProbe(ctx context.Context, endpoint *ua.EndpointDescription, u
 	color.Green("[+] credential login SUCCEEDED")
 }
 
-func runWriteableProbe(ctx context.Context, endpoint *ua.EndpointDescription, user, pass string, isAnon bool, batchSize int, outputFile string) {
+func runWriteableProbe(ctx context.Context, endpoint *ua.EndpointDescription, user, pass string, isAnon, isCreds bool, batchSize int, outputFile string) {
 	ctx, cancel := context.WithTimeout(ctx, 300*time.Second)
 	defer cancel()
 	var c *opcua.Client
 	var err error
-	if isAnon { //anon auth
+
+	if isAnon && !isCreds { //anon auth
 		fmt.Printf("[*] Attempting to find writeable tags on %s with Anonymous credentials\n", endpoint.EndpointURL)
 
-		c, err = opcua.NewClient(endpoint.EndpointURL, opcua.SecurityFromEndpoint(endpoint, ua.UserTokenTypeAnonymous), opcua.AuthAnonymous())
+		opts := []opcua.Option{
+			opcua.AuthUsername(user, pass),
+			opcua.SecurityFromEndpoint(endpoint, ua.UserTokenTypeAnonymous),
+		}
+		if endpoint.SecurityMode != ua.MessageSecurityModeNone {
+			opts = append(opts,
+				opcua.CertificateFile("client_cert.pem"),
+				opcua.PrivateKeyFile("client_key.pem"),
+				opcua.ApplicationURI("urn:cdino:opcua-recon"),
+			)
+		}
+		c, err = opcua.NewClient(endpoint.EndpointURL, opts...)
+
 		if err != nil {
 			fmt.Printf("[-] could not build client: %v\n", err)
 			return
@@ -297,7 +340,6 @@ func runWriteableProbe(ctx context.Context, endpoint *ua.EndpointDescription, us
 			color.Red("[-] anonymous login REJECTED (%v)\n", err)
 			return
 		}
-		//TODO review this flow
 	} else { //cred auth
 		fmt.Printf("[*] Attempting to find writeable tags with %s:%s\n", user, pass)
 
@@ -305,7 +347,13 @@ func runWriteableProbe(ctx context.Context, endpoint *ua.EndpointDescription, us
 			opcua.AuthUsername(user, pass),
 			opcua.SecurityFromEndpoint(endpoint, ua.UserTokenTypeUserName),
 		}
-
+		if endpoint.SecurityMode != ua.MessageSecurityModeNone {
+			opts = append(opts,
+				opcua.CertificateFile("client_cert.pem"),
+				opcua.PrivateKeyFile("client_key.pem"),
+				opcua.ApplicationURI("urn:cdino:opcua-recon"),
+			)
+		}
 		c, err = opcua.NewClient(endpoint.EndpointURL, opts...)
 		if err != nil {
 			fmt.Printf("[-] could not build client: %v\n", err)
@@ -516,4 +564,86 @@ func appendCSV(path string, endpoint *ua.EndpointDescription, isAnon bool, tags 
 			fmt.Sprintf("%v", t.Value),
 		})
 	}
+}
+
+func generateCertificateForPolicy(policyURI, certPath, keyPath string) error {
+	policy := policyURI
+	if idx := strings.LastIndex(policyURI, "#"); idx != -1 {
+		policy = policyURI[idx+1:]
+	}
+
+	if policy == "None" {
+		return nil
+	}
+
+	keySize := 2048
+	if policy == "Basic128Rsa15" || policy == "Basic256" {
+		keySize = 1024
+	}
+
+	if certSatisfiesPolicy(certPath, keySize) {
+		return nil // existing cert is adequate, reuse it
+	}
+
+	appURI, _ := url.Parse("urn:cdino:opcua-recon")
+	priv, err := rsa.GenerateKey(rand.Reader, keySize)
+	if err != nil {
+		return fmt.Errorf("generating key: %w", err)
+	}
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return fmt.Errorf("[-] failed to generate serial number: %s", err)
+	}
+	template := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject:      pkix.Name{CommonName: "opcua-recon-client", Organization: []string{"cdino"}},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().AddDate(1, 0, 0),
+		KeyUsage:     x509.KeyUsageContentCommitment | x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageDataEncipherment, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  false,
+		URIs:                  []*url.URL{appURI},
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		return fmt.Errorf("creating certificate: %w", err)
+	}
+
+	certOut, err := os.Create(certPath)
+	if err != nil {
+		return fmt.Errorf("writing cert file: %w", err)
+	}
+	defer certOut.Close()
+	pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: der})
+
+	keyOut, err := os.Create(keyPath)
+	if err != nil {
+		return fmt.Errorf("writing key file: %w", err)
+	}
+	defer keyOut.Close()
+	pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+
+	return nil
+}
+
+func certSatisfiesPolicy(certPath string, requiredKeySize int) bool {
+	data, err := os.ReadFile(certPath)
+	if err != nil {
+		return false // doesn't exist or unreadable — needs generating
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return false
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return false
+	}
+	pub, ok := cert.PublicKey.(*rsa.PublicKey)
+	if !ok {
+		return false // not RSA — regenerate
+	}
+	return pub.N.BitLen() >= requiredKeySize
 }

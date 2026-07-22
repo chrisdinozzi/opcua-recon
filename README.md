@@ -41,6 +41,7 @@ actually works, and scan for tags that are writeable by the authenticated sessio
 | `-rewrite-host` | Replace a server's advertised endpoint host (often an internal/NAT address) with the host you actually dialled |
 | `-output-file` | Append writeable-tag findings to this CSV file |
 | `-verbose` | Enable diagnostic output |
+| `-cleanup-certs`| delete generated client certificate/key files when the scan finishes |
 
 ### CSV output format
 When `-output-file` is set, each writeable tag found is appended as a row:
