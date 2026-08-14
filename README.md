@@ -112,3 +112,6 @@ Scan an OPC-UA Server by Endpoint that is behind NAT/Firewall, or has a hostname
 Specify a scanning batch size for writeable tag scan. useful for slow servers (slower the server, lower the batch count)
 
 `opcua-recon -endpoint "opc.tcp://123.45.67.89:4840" -rewrite-host -probe-anon -probe-write -batch-size 10`
+
+## Contributing
+If you find a bug or have a feature request, please raise it on this repo, or contact me directly. This program has only been throughly tested agaisnt one OPC-UA server implementation, so if you use it agaianst anything that isn't an S7-1200, please let me know how it works out for you :)
